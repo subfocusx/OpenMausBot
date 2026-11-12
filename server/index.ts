@@ -11243,8 +11243,7 @@ function appendSkillRequestCard(args: {
   botId: string;
   threadId: string;
   applied?: boolean;
-  previous?: SkillRequestCardData["previous"];
-  silent?: boolean;
+  previous?: SkillRequestCardData["previous"]; silent?: boolean;
   staged: {
     id: string;
     action: "create" | "update";
@@ -11260,10 +11259,7 @@ function appendSkillRequestCard(args: {
   const requestId = randomUUID();
   const copy = skillCardCopy(args.staged);
   const summary = `${copy.title} ${args.staged.gist}`.trim();
-  if (args.silent) {
-    skillReview.noteSkillChange(args.botId, args.threadId);
-    return { requestId, summary };
-  }
+  if (args.silent) { skillReview.noteSkillChange(args.botId, args.threadId); return { requestId, summary }; }
   const payload: SkillRequestCardData = {
     version: 1,
     requestId,
