@@ -11,8 +11,8 @@ import {
 import { MAUS_COLORS, type MausColor, type MausMotion, type MausState } from "@/lib/mascot";
 import { CARVED_BODIES, type CarvedBody, type CarvedBodyId } from "../../shared/carved-bodies";
 import type { CursorAvatarHandle } from "./CursorAvatar";
-import { mascotClock, usePrefersReducedMotion } from "./mascot-clock";
-import { frameFloorMs, nextFrameAt } from "./mascot-motion";
+import { carvedFrameMs, nextCarvedFrameAt, poseAtRest } from "./carved-rest";
+import { mascotClock, usePrefersReducedMotion, type MascotTicket } from "./mascot-clock";
 import { mascotFaceInk, type MascotFaceColor } from "../../shared/bot-avatar";
 
 /** Where the face looks and how it feels. */
@@ -173,22 +173,29 @@ function CarvedAvatarComponent(
   const cue = useRef({ blinkAt: -1, startleUntil: 0, pointer: null as null | { x: number; y: number } });
   const props = useRef({ state, gaze });
   props.current = { state, gaze };
+  /** The frame ticket while the loop runs: a resting face asks for no frames, so a cue has to wake it. */
+  const ticket = useRef<MascotTicket | null>(null);
   const [initial] = useState(() => carvedGeometry(body, pose.current));
 
   const startle = () => {
     cue.current.startleUntil = performance.now() + 1100;
     cue.current.blinkAt = performance.now();
+    ticket.current?.wake();
   };
   useImperativeHandle(ref, () => ({
-    blink: () => { cue.current.blinkAt = performance.now(); },
+    blink: () => { cue.current.blinkAt = performance.now(); ticket.current?.wake(); },
     spin: () => startle(),
     setExpression: () => {},
   }));
 
   useEffect(() => {
     if (!live || motion === "none") return;
-    if (motion === "blink") cue.current.blinkAt = performance.now();
-    else if (STARTLE.has(motion)) startle();
+    if (motion === "blink") {
+      cue.current.blinkAt = performance.now();
+      // A resting face has no frame pending, so the cue has to ask for one or the blink would wait for the next
+      // scheduled glance and be over by then.
+      ticket.current?.wake();
+    } else if (STARTLE.has(motion)) startle();
   }, [motion, motionKey, live]);
 
   const paint = (p: CarvedPose) => {
@@ -213,6 +220,13 @@ function CarvedAvatarComponent(
     paint(pose.current);
   }, [state, live, body]);
 
+  // A new mood or an outside gaze is a change to draw, even while the face rests between glances.
+  const gazeX = gaze?.x, gazeY = gaze?.y;
+  useEffect(() => {
+    if (!live) return;
+    ticket.current?.wake();
+  }, [state, gazeX, gazeY, live]);
+
   useEffect(() => {
     if (!live) return;
     let last = performance.now();
@@ -234,27 +248,44 @@ function CarvedAvatarComponent(
       }
       const pointer = cue.current.pointer;
       const outside = props.current.gaze;
+      const clamp = (value: number) => Math.max(-1, Math.min(1, value));
       const want: CarvedPose = {
-        gx: pointer?.x ?? (mood.gx ?? (rate > 0 ? target[0] : 0)) + (outside?.x ?? 0),
-        gy: pointer?.y ?? (mood.gy ?? (rate > 0 ? target[1] : 0)) + (outside?.y ?? 0),
+        gx: clamp(pointer?.x ?? (mood.gx ?? (rate > 0 ? target[0] : 0)) + (outside?.x ?? 0)),
+        gy: clamp(pointer?.y ?? (mood.gy ?? (rate > 0 ? target[1] : 0)) + (outside?.y ?? 0)),
         wide: now < cue.current.startleUntil ? 1 : mood.wide ?? 0,
         shut: mood.shut ?? 0,
         smile: mood.smile ?? 1,
       };
       const p = pose.current;
       const k = (speed: number) => 1 - Math.exp(-dt * speed);
-      p.gx += (Math.max(-1, Math.min(1, want.gx)) - p.gx) * k(9);
-      p.gy += (Math.max(-1, Math.min(1, want.gy)) - p.gy) * k(9);
+      p.gx += (want.gx - p.gx) * k(9);
+      p.gy += (want.gy - p.gy) * k(9);
       p.wide += (want.wide - p.wide) * k(want.wide > p.wide ? 18 : 7);
       p.smile += (want.smile - p.smile) * k(8);
       const since = cue.current.blinkAt < 0 ? 1 : (now - cue.current.blinkAt) / 200;
       const blink = since >= 1 ? 0 : since < 0.45 ? since / 0.45 : 1 - (since - 0.45) / 0.55;
       p.shut += (Math.max(want.shut, blink) - p.shut) * (blink > 0 ? 1 : k(10));
+      const arrived = poseAtRest(p, want);
+      // Arriving is worth one last exact pose: an eased value never quite reaches its target, and the face would
+      // otherwise keep drawing a difference too small to see.
+      if (arrived) Object.assign(p, want);
       paint(p);
-      return nextFrameAt(now, frameFloorMs(size));
+      return nextCarvedFrameAt({
+        now,
+        frameMs: carvedFrameMs(size),
+        // A pointer that rests still over the face is no reason to keep drawing: its pose has arrived, and the next
+        // pointer move wakes the ticket through `onPointerMove`.
+        moving: !arrived || since < 1 || now < cue.current.startleUntil,
+        glanceAt: rate > 0 ? glanceAt : Infinity,
+        blinkAt,
+      });
     };
-    const ticket = mascotClock().add(step, group.current?.ownerSVGElement);
-    return () => ticket.remove();
+    const frame = mascotClock().add(step, group.current?.ownerSVGElement);
+    ticket.current = frame;
+    return () => {
+      ticket.current = null;
+      frame.remove();
+    };
   }, [body, live, size]);
 
   const onPointerMove = (event: ReactPointerEvent<HTMLSpanElement>) => {
@@ -263,8 +294,9 @@ function CarvedAvatarComponent(
       x: Math.max(-1, Math.min(1, ((event.clientX - rect.left) / rect.width) * 2 - 1)),
       y: Math.max(-1, Math.min(1, ((event.clientY - rect.top) / rect.height) * 2 - 1)),
     };
+    ticket.current?.wake();
   };
-  const onPointerLeave = () => { cue.current.pointer = null; };
+  const onPointerLeave = () => { cue.current.pointer = null; ticket.current?.wake(); };
 
   const fills = carvedFills(body, color);
   const resolve = (fill: string) => (fill === "body" ? fills.body : fill === "accent" ? fills.accent : fill);
